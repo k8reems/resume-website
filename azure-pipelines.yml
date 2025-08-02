@@ -1,0 +1,240 @@
+# Azure DevOps Pipeline for Resume Website Deployment
+# Triggers on main branch changes and deploys to Azure Storage
+
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Azure Service Connection (to be configured in Azure DevOps)
+  azureServiceConnection: 'AzureServiceConnection'
+  # Resource Group and Storage Account from Terraform
+  resourceGroupName: 'rg-resume-website'
+  storageAccountName: 'stresumewebk8reems'
+  # Website files to deploy
+  websiteSource: '.'
+
+stages:
+- stage: Build
+  displayName: 'Build Stage'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build Website'
+    steps:
+    - checkout: self
+      displayName: 'Checkout Source Code'
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '16.x'
+      displayName: 'Install Node.js'
+
+    - script: |
+        echo "Installing dependencies..."
+        # If you add package.json later for build tools, install them here
+        # npm install
+        
+        echo "Validating HTML files..."
+        # Basic validation - check if index.html exists
+        if [ ! -f "index.html" ]; then
+          echo "Error: index.html not found!"
+          exit 1
+        fi
+        
+        echo "Validating required files..."
+        required_files=("index.html" "styles.css" "script.js" "404.html")
+        for file in "${required_files[@]}"; do
+          if [ ! -f "$file" ]; then
+            echo "Error: Required file $file not found!"
+            exit 1
+          fi
+        done
+        
+        echo "Build validation completed successfully!"
+      displayName: 'Validate Website Files'
+
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(websiteSource)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/website.zip'
+        excludePattern: |
+          .git/**
+          .terraform/**
+          terraform.tfstate*
+          *.tfvars
+          .DS_Store
+          README.md
+          azure-pipelines.yml
+          main.tf
+          variables.tf
+          outputs.tf
+      displayName: 'Archive Website Files'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'website-artifacts'
+      displayName: 'Publish Build Artifacts'
+
+- stage: Deploy
+  displayName: 'Deploy to Azure Storage'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployWebsite
+    displayName: 'Deploy to Azure Storage'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: website-artifacts
+            displayName: 'Download Build Artifacts'
+
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: '$(Pipeline.Workspace)/website-artifacts/website.zip'
+              destinationFolder: '$(Pipeline.Workspace)/website'
+            displayName: 'Extract Website Files'
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Starting deployment to Azure Storage..."
+                
+                # Get storage account key
+                STORAGE_KEY=$(az storage account keys list \
+                  --resource-group $(resourceGroupName) \
+                  --account-name $(storageAccountName) \
+                  --query '[0].value' \
+                  --output tsv)
+                
+                echo "Uploading website files to Azure Storage..."
+                
+                # Upload all files to $web container (static website container)
+                az storage blob upload-batch \
+                  --account-name $(storageAccountName) \
+                  --account-key $STORAGE_KEY \
+                  --destination '$web' \
+                  --source '$(Pipeline.Workspace)/website' \
+                  --overwrite true
+                
+                echo "Setting content types for web files..."
+                
+                # Set proper content types
+                az storage blob update \
+                  --account-name $(storageAccountName) \
+                  --account-key $STORAGE_KEY \
+                  --container-name '$web' \
+                  --name 'index.html' \
+                  --content-type 'text/html'
+                
+                az storage blob update \
+                  --account-name $(storageAccountName) \
+                  --account-key $STORAGE_KEY \
+                  --container-name '$web' \
+                  --name '404.html' \
+                  --content-type 'text/html'
+                
+                az storage blob update \
+                  --account-name $(storageAccountName) \
+                  --account-key $STORAGE_KEY \
+                  --container-name '$web' \
+                  --name 'styles.css' \
+                  --content-type 'text/css'
+                
+                az storage blob update \
+                  --account-name $(storageAccountName) \
+                  --account-key $STORAGE_KEY \
+                  --container-name '$web' \
+                  --name 'script.js' \
+                  --content-type 'application/javascript'
+                
+                echo "Deployment completed successfully!"
+                
+                # Get the website URL
+                WEBSITE_URL=$(az storage account show \
+                  --resource-group $(resourceGroupName) \
+                  --name $(storageAccountName) \
+                  --query 'primaryEndpoints.web' \
+                  --output tsv)
+                
+                echo "Website URL: $WEBSITE_URL"
+                echo "##vso[task.setvariable variable=websiteUrl;isOutput=true]$WEBSITE_URL"
+            displayName: 'Deploy Website to Azure Storage'
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Purging CDN cache if CDN is enabled..."
+                
+                # Check if CDN endpoint exists (optional)
+                CDN_ENDPOINT=$(az cdn endpoint list \
+                  --resource-group $(resourceGroupName) \
+                  --profile-name resume-website-cdn \
+                  --query '[0].name' \
+                  --output tsv 2>/dev/null || echo "")
+                
+                if [ ! -z "$CDN_ENDPOINT" ]; then
+                  echo "Purging CDN cache for endpoint: $CDN_ENDPOINT"
+                  az cdn endpoint purge \
+                    --resource-group $(resourceGroupName) \
+                    --profile-name resume-website-cdn \
+                    --name $CDN_ENDPOINT \
+                    --content-paths '/*'
+                else
+                  echo "No CDN endpoint found, skipping cache purge"
+                fi
+            displayName: 'Purge CDN Cache (Optional)'
+            continueOnError: true
+
+- stage: PostDeployment
+  displayName: 'Post-Deployment Verification'
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+  - job: VerifyDeployment
+    displayName: 'Verify Website Deployment'
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get the website URL
+          WEBSITE_URL=$(az storage account show \
+            --resource-group $(resourceGroupName) \
+            --name $(storageAccountName) \
+            --query 'primaryEndpoints.web' \
+            --output tsv)
+          
+          echo "Verifying website accessibility..."
+          echo "Website URL: $WEBSITE_URL"
+          
+          # Test website availability
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${WEBSITE_URL}")
+          
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✅ Website is successfully accessible!"
+            echo "🚀 Resume website deployed at: $WEBSITE_URL"
+          else
+            echo "❌ Website verification failed. HTTP Status: $HTTP_STATUS"
+            exit 1
+          fi
+          
+          # Test 404 page
+          NOT_FOUND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${WEBSITE_URL}nonexistent-page")
+          echo "404 page test status: $NOT_FOUND_STATUS"
+      displayName: 'Verify Website Accessibility'
